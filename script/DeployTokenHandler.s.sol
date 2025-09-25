@@ -7,7 +7,7 @@ import "../src/SecureWelcomeHomeProperty.sol";
 
 contract DeployTokenHandler is Script {
     function run() external {
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        uint256 deployerPrivateKey = vm.envUint("HEDERA_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("Deploying contracts with the account:", deployer);
@@ -21,9 +21,9 @@ contract DeployTokenHandler is Script {
             "WHT"
         );
 
-        // For demo purposes, using a mock payment token address
-        // In production, this would be the HBAR token or USDC on Hedera
-        address paymentToken = address(0x1234567890123456789012345678901234567890); // Replace with actual token
+        // For demo purposes, using HBAR wrapped token address on Hedera Testnet
+        // WHBAR on Hedera Testnet: 0x0000000000000000000000000000000000000001
+        address paymentToken = address(0x0000000000000000000000000000000000000001);
 
         // Deploy the token handler
         PropertyTokenHandler tokenHandler = new PropertyTokenHandler(

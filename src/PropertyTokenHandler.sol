@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
-
-interface IPropertyToken {
-    function mint(address to, uint256 amount) external;
-    function burn(uint256 amount) external;
-    function burnFrom(address account, uint256 amount) external;
-    function balanceOf(address account) external view returns (uint256);
-    function totalSupply() external view returns (uint256);
-    function getRemainingTokens() external view returns (uint256);
-}
+import "./interfaces/IPropertyToken.sol";
 
 /// @title PropertyTokenHandler
 /// @notice Handles token operations, marketplace functionality, and property investment management
@@ -38,6 +30,8 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         bool isActive;
         uint256 totalSold;
         uint256 maxSupply;
+        uint256 saleEndTime;
+        uint256 propertyId;
     }
 
     struct MarketplaceListing {
@@ -46,6 +40,8 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         uint256 pricePerToken;
         uint256 listingTime;
         bool isActive;
+        uint256 propertyId;
+        address tokenContract;
     }
 
     struct StakingInfo {
@@ -53,6 +49,7 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         uint256 stakeTime;
         uint256 lastRewardClaim;
         uint256 totalRewards;
+        uint256 propertyId;
     }
 
     struct PropertyRevenue {
@@ -60,8 +57,27 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         uint256 distributedRevenue;
         uint256 revenuePerToken;
         uint256 lastDistribution;
+        uint256 propertyId;
+        address tokenContract;
     }
 
+    struct PropertyMetrics {
+        uint256 totalTokensSold;
+        uint256 totalRevenue;
+        uint256 averageTokenPrice;
+        uint256 totalStaked;
+        uint256 activeListings;
+        uint256 lastUpdated;
+    }
+
+    // Multi-property support
+    mapping(uint256 => TokenSale) public propertySales;
+    mapping(uint256 => PropertyRevenue) public propertyRevenues;
+    mapping(uint256 => PropertyMetrics) public propertyMetrics;
+    mapping(uint256 => mapping(address => StakingInfo)) public propertyStaking; // propertyId => user => staking info
+    mapping(uint256 => mapping(address => uint256)) public propertyClaimableRevenue; // propertyId => user => amount
+
+    // Legacy support (backwards compatibility)
     TokenSale public currentSale;
     PropertyRevenue public propertyRevenue;
 
@@ -149,8 +165,44 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
             maxPurchase: _maxPurchase,
             isActive: true,
             totalSold: 0,
-            maxSupply: _maxSupply
+            maxSupply: _maxSupply,
+            saleEndTime: 0,
+            propertyId: 0
         });
+
+        emit SaleConfigured(_pricePerToken, _minPurchase, _maxPurchase, _maxSupply);
+    }
+
+    function configureSaleForProperty(
+        uint256 _propertyId,
+        uint256 _pricePerToken,
+        uint256 _minPurchase,
+        uint256 _maxPurchase,
+        uint256 _maxSupply,
+        uint256 _saleEndTime
+    ) external onlyRole(OPERATOR_ROLE) validAmount(_pricePerToken) {
+        propertySales[_propertyId] = TokenSale({
+            pricePerToken: _pricePerToken,
+            minPurchase: _minPurchase,
+            maxPurchase: _maxPurchase,
+            isActive: true,
+            totalSold: 0,
+            maxSupply: _maxSupply,
+            saleEndTime: _saleEndTime,
+            propertyId: _propertyId
+        });
+
+        // Initialize property metrics if not exists
+        if (propertyMetrics[_propertyId].lastUpdated == 0) {
+            propertyMetrics[_propertyId] = PropertyMetrics({
+                totalTokensSold: 0,
+                totalRevenue: 0,
+                averageTokenPrice: _pricePerToken,
+                totalStaked: 0,
+                activeListings: 0,
+                lastUpdated: block.timestamp
+            });
+        }
 
         emit SaleConfigured(_pricePerToken, _minPurchase, _maxPurchase, _maxSupply);
     }
@@ -174,7 +226,7 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         }
 
         paymentToken.safeTransferFrom(msg.sender, address(this), totalCost);
-        propertyToken.mint(msg.sender, tokenAmount);
+        propertyToken.mint(msg.sender, tokenAmount * 10**18);
 
         currentSale.totalSold += tokenAmount;
 
@@ -193,7 +245,9 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
             amount: amount,
             pricePerToken: pricePerToken,
             listingTime: block.timestamp,
-            isActive: true
+            isActive: true,
+            propertyId: 0, // Single property mode
+            tokenContract: address(propertyToken)
         });
 
         emit TokensListed(listingId, msg.sender, amount, pricePerToken);
@@ -356,5 +410,244 @@ contract PropertyTokenHandler is AccessControl, ReentrancyGuard, Pausable {
         validAddress(token)
     {
         IERC20(token).safeTransfer(msg.sender, amount);
+    }
+
+    // Multi-Property Functions
+
+    function purchaseTokensFromProperty(
+        uint256 propertyId,
+        address tokenContract,
+        uint256 tokenAmount
+    )
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        onlyAccredited
+        validAmount(tokenAmount)
+    {
+        TokenSale storage sale = propertySales[propertyId];
+        if (!sale.isActive) revert TokenSaleNotActive();
+        if (sale.saleEndTime > 0 && block.timestamp > sale.saleEndTime) revert TokenSaleNotActive();
+        if (tokenAmount < sale.minPurchase) revert PurchaseAmountTooLow();
+        if (tokenAmount > sale.maxPurchase) revert PurchaseAmountTooHigh();
+
+        uint256 totalCost = tokenAmount * sale.pricePerToken;
+        if (address(paymentToken) == address(0)) {
+            // Native token payment (HBAR)
+            if (msg.value < totalCost) revert InsufficientPayment();
+        } else {
+            if (paymentToken.balanceOf(msg.sender) < totalCost) revert InsufficientPayment();
+            paymentToken.safeTransferFrom(msg.sender, address(this), totalCost);
+        }
+
+        if (sale.maxSupply > 0 && sale.totalSold + tokenAmount > sale.maxSupply) {
+            revert PurchaseAmountTooHigh();
+        }
+
+        // Mint tokens from the specific property contract
+        IPropertyToken(tokenContract).mint(msg.sender, tokenAmount);
+
+        sale.totalSold += tokenAmount;
+        _updatePropertyMetrics(propertyId, tokenAmount, totalCost, 0, 0);
+
+        emit TokensPurchased(msg.sender, tokenAmount, totalCost);
+    }
+
+    function distributeRevenueForProperty(
+        uint256 propertyId,
+        address tokenContract,
+        uint256 revenueAmount
+    )
+        external
+        onlyRole(REVENUE_MANAGER_ROLE)
+        validAmount(revenueAmount)
+    {
+        IPropertyToken tokenInstance = IPropertyToken(tokenContract);
+        uint256 totalSupply = tokenInstance.totalSupply();
+        if (totalSupply == 0) return;
+
+        uint256 revenuePerToken = revenueAmount / totalSupply;
+
+        PropertyRevenue storage revenue = propertyRevenues[propertyId];
+        revenue.totalRevenue += revenueAmount;
+        revenue.revenuePerToken += revenuePerToken;
+        revenue.lastDistribution = block.timestamp;
+        revenue.propertyId = propertyId;
+        revenue.tokenContract = tokenContract;
+
+        paymentToken.safeTransferFrom(msg.sender, address(this), revenueAmount);
+        _updatePropertyMetrics(propertyId, 0, revenueAmount, 0, 0);
+
+        emit RevenueDistributed(revenueAmount, revenuePerToken);
+    }
+
+    function claimRevenueForProperty(
+        uint256 propertyId,
+        address tokenContract
+    ) external nonReentrant {
+        IPropertyToken tokenInstance = IPropertyToken(tokenContract);
+        uint256 balance = tokenInstance.balanceOf(msg.sender);
+        PropertyRevenue storage revenue = propertyRevenues[propertyId];
+
+        uint256 totalClaimable = (balance * revenue.revenuePerToken) - propertyClaimableRevenue[propertyId][msg.sender];
+
+        if (totalClaimable == 0) revert NoRewardsAvailable();
+
+        propertyClaimableRevenue[propertyId][msg.sender] += totalClaimable;
+        paymentToken.safeTransfer(msg.sender, totalClaimable);
+
+        emit RevenueClaimedByHolder(msg.sender, totalClaimable);
+    }
+
+    function stakeTokensForProperty(
+        uint256 propertyId,
+        address tokenContract,
+        uint256 amount
+    ) external nonReentrant whenNotPaused validAmount(amount) {
+        IPropertyToken tokenInstance = IPropertyToken(tokenContract);
+        if (tokenInstance.balanceOf(msg.sender) < amount) revert InsufficientTokenBalance();
+
+        StakingInfo storage stake = propertyStaking[propertyId][msg.sender];
+
+        if (stake.stakedAmount > 0) {
+            uint256 pendingRewards = calculateStakingRewardsForProperty(propertyId, msg.sender);
+            stake.totalRewards += pendingRewards;
+        }
+
+        IERC20(tokenContract).safeTransferFrom(msg.sender, address(this), amount);
+
+        stake.stakedAmount += amount;
+        stake.stakeTime = block.timestamp;
+        stake.lastRewardClaim = block.timestamp;
+        stake.propertyId = propertyId;
+
+        _updatePropertyMetrics(propertyId, 0, 0, int256(amount), 0);
+
+        emit TokensStaked(msg.sender, amount);
+    }
+
+    function unstakeTokensForProperty(
+        uint256 propertyId,
+        address tokenContract,
+        uint256 amount
+    ) external nonReentrant validAmount(amount) {
+        StakingInfo storage stake = propertyStaking[propertyId][msg.sender];
+        if (stake.stakedAmount < amount) revert InsufficientTokenBalance();
+        if (block.timestamp < stake.stakeTime + MIN_STAKE_DURATION) revert StakingPeriodNotMet();
+
+        uint256 rewards = calculateStakingRewardsForProperty(propertyId, msg.sender);
+        uint256 fee = (rewards * stakingFee) / BASIS_POINTS;
+        uint256 netRewards = rewards - fee;
+
+        stake.stakedAmount -= amount;
+        stake.totalRewards += netRewards;
+        stake.lastRewardClaim = block.timestamp;
+
+        IERC20(tokenContract).safeTransfer(msg.sender, amount);
+
+        if (netRewards > 0) {
+            IPropertyToken(tokenContract).mint(msg.sender, netRewards);
+            if (fee > 0) {
+                IPropertyToken(tokenContract).mint(feeCollector, fee);
+            }
+        }
+
+        _updatePropertyMetrics(propertyId, 0, 0, -int256(amount), 0);
+
+        emit TokensUnstaked(msg.sender, amount, netRewards);
+    }
+
+    function calculateStakingRewardsForProperty(
+        uint256 propertyId,
+        address staker
+    ) public view returns (uint256) {
+        StakingInfo memory stake = propertyStaking[propertyId][staker];
+        if (stake.stakedAmount == 0) return 0;
+
+        uint256 timeStaked = block.timestamp - stake.lastRewardClaim;
+        uint256 annualReward = (stake.stakedAmount * STAKING_REWARD_RATE) / BASIS_POINTS;
+        return (annualReward * timeStaked) / 365 days;
+    }
+
+    function getPropertySale(uint256 propertyId)
+        external
+        view
+        returns (TokenSale memory)
+    {
+        return propertySales[propertyId];
+    }
+
+    function getPropertyRevenue(uint256 propertyId)
+        external
+        view
+        returns (PropertyRevenue memory)
+    {
+        return propertyRevenues[propertyId];
+    }
+
+    function getPropertyMetrics(uint256 propertyId)
+        external
+        view
+        returns (PropertyMetrics memory)
+    {
+        return propertyMetrics[propertyId];
+    }
+
+    function getPropertyStaking(uint256 propertyId, address user)
+        external
+        view
+        returns (StakingInfo memory)
+    {
+        return propertyStaking[propertyId][user];
+    }
+
+    function getClaimableRevenueForProperty(
+        uint256 propertyId,
+        address tokenContract,
+        address holder
+    ) external view returns (uint256) {
+        IPropertyToken tokenInstance = IPropertyToken(tokenContract);
+        uint256 balance = tokenInstance.balanceOf(holder);
+        PropertyRevenue storage revenue = propertyRevenues[propertyId];
+        return (balance * revenue.revenuePerToken) - propertyClaimableRevenue[propertyId][holder];
+    }
+
+    function _updatePropertyMetrics(
+        uint256 propertyId,
+        uint256 tokensSold,
+        uint256 revenue,
+        int256 stakingChange,
+        int256 listingChange
+    ) internal {
+        PropertyMetrics storage metrics = propertyMetrics[propertyId];
+
+        metrics.totalTokensSold += tokensSold;
+        metrics.totalRevenue += revenue;
+
+        if (tokensSold > 0 && revenue > 0) {
+            metrics.averageTokenPrice = metrics.totalRevenue / metrics.totalTokensSold;
+        }
+
+        if (stakingChange > 0) {
+            metrics.totalStaked += uint256(stakingChange);
+        } else if (stakingChange < 0) {
+            metrics.totalStaked -= uint256(-stakingChange);
+        }
+
+        if (listingChange > 0) {
+            metrics.activeListings += uint256(listingChange);
+        } else if (listingChange < 0) {
+            metrics.activeListings -= uint256(-listingChange);
+        }
+
+        metrics.lastUpdated = block.timestamp;
+    }
+
+    function setPropertyActive(uint256 propertyId, bool isActive)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        propertySales[propertyId].isActive = isActive;
     }
 }

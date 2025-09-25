@@ -6,7 +6,7 @@ import "../src/SecureWelcomeHomeProperty.sol";
 
 contract DeployScript is Script {
     function run() external {
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        uint256 deployerPrivateKey = vm.envUint("HEDERA_PRIVATE_KEY");
         address deployerAddress = vm.addr(deployerPrivateKey);
 
         console.log("Deploying from address:", deployerAddress);
@@ -40,7 +40,7 @@ contract DeployWithConfigScript is Script {
     }
 
     function run() external {
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        uint256 deployerPrivateKey = vm.envUint("HEDERA_PRIVATE_KEY");
         address deployerAddress = vm.addr(deployerPrivateKey);
 
         // Load configuration

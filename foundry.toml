@@ -5,6 +5,7 @@ libs = ["lib"]
 solc = "0.8.20"
 optimizer = true
 optimizer_runs = 200
+via_ir = true
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/"
@@ -14,11 +15,19 @@ remappings = [
 # Hedera testnet configuration
 eth_rpc_url = "https://testnet.hashio.io/api"
 chain_id = 296
+gas_limit = 6000000
+gas_price = 2000000000
+optimizer = true
+optimizer_runs = 200
 
 [profile.hedera_mainnet]
 # Hedera mainnet configuration
 eth_rpc_url = "https://mainnet.hashio.io/api"
 chain_id = 295
+gas_limit = 6000000
+gas_price = 2000000000
+optimizer = true
+optimizer_runs = 200
 
 [fmt]
 line_length = 120
@@ -39,3 +48,7 @@ fail_on_revert = false
 runs = 256
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+# RPC endpoints configuration (following Hedera best practices)
+[rpc_endpoints]
+hedera = "${HEDERA_RPC_URL}"
