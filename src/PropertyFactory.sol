@@ -7,6 +7,8 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./SecureWelcomeHomeProperty.sol";
 import "./PropertyTokenHandler.sol";
 import "./interfaces/IPropertyToken.sol";
+import "./MockKYCRegistry.sol";
+import "./OwnershipRegistry.sol";
 
 /// @title PropertyFactory
 /// @notice Factory contract for deploying and managing multiple tokenized properties
@@ -51,6 +53,8 @@ contract PropertyFactory is AccessControl, ReentrancyGuard, Pausable {
     uint256 public constant MAX_PROPERTIES = 1000;
     uint256 public propertyCreationFee = 1 ether; // 1 HBAR
     address public feeCollector;
+    MockKYCRegistry public immutable kycRegistry;
+    OwnershipRegistry public immutable ownershipRegistry;
 
     event PropertyDeployed(
         uint256 indexed propertyId,
@@ -88,8 +92,14 @@ contract PropertyFactory is AccessControl, ReentrancyGuard, Pausable {
         _;
     }
 
-    constructor(address _feeCollector) validAddress(_feeCollector) {
+    constructor(address _feeCollector, address _kycRegistry, address _ownershipRegistry)
+        validAddress(_feeCollector)
+        validAddress(_kycRegistry)
+        validAddress(_ownershipRegistry)
+    {
         feeCollector = _feeCollector;
+        kycRegistry = MockKYCRegistry(_kycRegistry);
+        ownershipRegistry = OwnershipRegistry(_ownershipRegistry);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(PROPERTY_CREATOR_ROLE, msg.sender);
@@ -116,12 +126,27 @@ contract PropertyFactory is AccessControl, ReentrancyGuard, Pausable {
         PropertyTokenHandler tokenHandler = new PropertyTokenHandler(
             address(propertyToken),
             params.paymentToken,
-            feeCollector
+            feeCollector,
+            address(kycRegistry),
+            address(ownershipRegistry),
+            propertyId
         );
 
         // Grant necessary roles to the token handler
         propertyToken.grantRole(propertyToken.MINTER_ROLE(), address(tokenHandler));
         propertyToken.grantRole(propertyToken.PROPERTY_MANAGER_ROLE(), address(tokenHandler));
+
+        // Grant DEFAULT_ADMIN_ROLE back to the caller for property management
+        propertyToken.grantRole(0x00, msg.sender); // DEFAULT_ADMIN_ROLE
+
+        // Grant property creator OPERATOR_ROLE on the PropertyTokenHandler to configure sales
+        tokenHandler.grantRole(tokenHandler.OPERATOR_ROLE(), msg.sender);
+
+        // Grant property creator REVENUE_MANAGER_ROLE on the PropertyTokenHandler to distribute revenue
+        tokenHandler.grantRole(tokenHandler.REVENUE_MANAGER_ROLE(), msg.sender);
+
+        // Grant PropertyTokenHandler the role to update ownership registry
+        ownershipRegistry.grantRole(ownershipRegistry.PROPERTY_UPDATER_ROLE(), address(tokenHandler));
 
         // Initialize property token
         propertyToken.connectToProperty(address(this), string(abi.encodePacked("PROP-", propertyCount)));
@@ -147,6 +172,13 @@ contract PropertyFactory is AccessControl, ReentrancyGuard, Pausable {
 
         // Track properties by creator
         creatorProperties[msg.sender].push(propertyId);
+
+        // Register property with ownership registry
+        ownershipRegistry.registerProperty(
+            propertyId,
+            address(propertyToken),
+            address(tokenHandler)
+        );
 
         // Transfer creation fee
         payable(feeCollector).transfer(msg.value);
@@ -322,6 +354,74 @@ contract PropertyFactory is AccessControl, ReentrancyGuard, Pausable {
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
         payable(msg.sender).transfer(address(this).balance);
+    }
+
+    function getFactoryStats() external view returns (
+        uint256 totalProperties,
+        uint256 totalActiveProperties,
+        uint256 creationFee
+    ) {
+        uint256 activeCount = 0;
+        for (uint256 i = 0; i < propertyCount; i++) {
+            if (properties[i].isActive) {
+                activeCount++;
+            }
+        }
+
+        return (propertyCount, activeCount, propertyCreationFee);
+    }
+
+    function getPropertySummary(uint256 propertyId) external view validPropertyId(propertyId) returns (
+        string memory name,
+        string memory location,
+        uint256 totalValue,
+        uint256 maxTokens,
+        address creator,
+        bool isActive,
+        bool isVerified
+    ) {
+        PropertyInfo memory prop = properties[propertyId];
+        return (
+            prop.name,
+            prop.location,
+            prop.totalValue,
+            prop.maxTokens,
+            prop.creator,
+            prop.isActive,
+            verifiedProperties[prop.tokenContract]
+        );
+    }
+
+    function getAllPropertiesPaginated(uint256 offset, uint256 limit) external view returns (
+        PropertyInfo[] memory propertyList,
+        uint256 totalCount
+    ) {
+        uint256 end = offset + limit;
+        if (end > propertyCount) {
+            end = propertyCount;
+        }
+
+        propertyList = new PropertyInfo[](end - offset);
+
+        for (uint256 i = offset; i < end; i++) {
+            propertyList[i - offset] = properties[i];
+        }
+
+        return (propertyList, propertyCount);
+    }
+
+    function getUserCreatedProperties(address user) external view returns (
+        uint256[] memory propertyIds,
+        PropertyInfo[] memory propertyDetails
+    ) {
+        uint256[] memory userPropIds = creatorProperties[user];
+        PropertyInfo[] memory details = new PropertyInfo[](userPropIds.length);
+
+        for (uint256 i = 0; i < userPropIds.length; i++) {
+            details[i] = properties[userPropIds[i]];
+        }
+
+        return (userPropIds, details);
     }
 
     receive() external payable {}

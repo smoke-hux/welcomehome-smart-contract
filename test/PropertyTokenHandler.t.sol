@@ -4,6 +4,8 @@ pragma solidity ^0.8.20;
 import "forge-std/Test.sol";
 import "../src/PropertyTokenHandler.sol";
 import "../src/SecureWelcomeHomeProperty.sol";
+import "../src/MockKYCRegistry.sol";
+import "../src/OwnershipRegistry.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 // Mock HBAR/payment token for testing
@@ -21,6 +23,8 @@ contract PropertyTokenHandlerTest is Test {
     PropertyTokenHandler public handler;
     SecureWelcomeHomeProperty public propertyToken;
     MockPaymentToken public paymentToken;
+    MockKYCRegistry public kycRegistry;
+    OwnershipRegistry public ownershipRegistry;
 
     address public admin = address(0x1);
     address public operator = address(0x2);
@@ -48,12 +52,32 @@ contract PropertyTokenHandlerTest is Test {
         propertyToken.grantRole(propertyToken.PROPERTY_MANAGER_ROLE(), admin);
         propertyToken.connectToProperty(address(0x100), "TEST-TX-001");
 
+        // Deploy additional dependencies
+        kycRegistry = new MockKYCRegistry();
+        ownershipRegistry = new OwnershipRegistry();
+
+        // Grant roles to handler for ownership registry
+        ownershipRegistry.grantRole(ownershipRegistry.PROPERTY_UPDATER_ROLE(), address(this));
+
         // Deploy handler
         handler = new PropertyTokenHandler(
             address(propertyToken),
             address(paymentToken),
-            feeCollector
+            feeCollector,
+            address(kycRegistry),
+            address(ownershipRegistry),
+            0 // propertyId
         );
+
+        // Grant roles to handler for ownership registry
+        ownershipRegistry.grantRole(ownershipRegistry.PROPERTY_UPDATER_ROLE(), address(handler));
+
+        // Register property in ownership registry (required for token operations)
+        ownershipRegistry.registerProperty(0, address(propertyToken), address(handler));
+
+        // Setup KYC for investors
+        kycRegistry.setAccreditedInvestor(investor1, true);
+        kycRegistry.setAccreditedInvestor(investor2, true);
 
         // Grant minter role to handler
         propertyToken.grantRole(propertyToken.MINTER_ROLE(), address(handler));
@@ -118,10 +142,6 @@ contract PropertyTokenHandlerTest is Test {
         vm.prank(operator);
         handler.configureSale(1 * 10**18, 10, 1000, 100000); // price per token, min, max, supply in base units
 
-        // Set investor1 as accredited
-        vm.prank(admin);
-        handler.setAccreditedInvestor(investor1, true);
-
         vm.startPrank(investor1);
 
         // Purchase 100 base units of tokens
@@ -164,9 +184,6 @@ contract PropertyTokenHandlerTest is Test {
         vm.prank(operator);
         handler.configureSale(1 * 10**18, 100 * 10**18, 1000 * 10**18, 100000 * 10**18);
 
-        vm.prank(admin);
-        handler.setAccreditedInvestor(investor1, true);
-
         vm.startPrank(investor1);
 
         paymentToken.approve(address(handler), 50 * 10**18);
@@ -180,9 +197,6 @@ contract PropertyTokenHandlerTest is Test {
     function testCannotPurchaseAboveMaximum() public {
         vm.prank(operator);
         handler.configureSale(1 * 10**18, 10 * 10**18, 100 * 10**18, 100000 * 10**18);
-
-        vm.prank(admin);
-        handler.setAccreditedInvestor(investor1, true);
 
         vm.startPrank(investor1);
 
@@ -201,7 +215,7 @@ contract PropertyTokenHandlerTest is Test {
 
         vm.startPrank(investor1);
         propertyToken.approve(address(handler), 100 * 10**18);
-        handler.listTokensForSale(100 * 10**18, 2); // List 100 tokens at 2 HBAR each (price as integer)
+        handler.listTokensForSale(100 * 10**18, 2 * 10**18); // List 100 tokens at 2 HBAR each (price in 18 decimals)
 
         (
             address seller,
@@ -215,7 +229,7 @@ contract PropertyTokenHandlerTest is Test {
 
         assertEq(seller, investor1);
         assertEq(amount, 100 * 10**18);
-        assertEq(pricePerToken, 2); // Price stored as integer
+        assertEq(pricePerToken, 2 * 10**18); // Price stored in 18 decimals
         assertEq(listingTime, block.timestamp);
         assertTrue(isActive);
 
@@ -228,13 +242,13 @@ contract PropertyTokenHandlerTest is Test {
         // List tokens (seller needs to approve first)
         vm.startPrank(investor1);
         propertyToken.approve(address(handler), 100 * 10**18);
-        handler.listTokensForSale(100 * 10**18, 2); // Price as integer, not in wei
+        handler.listTokensForSale(100 * 10**18, 2 * 10**18); // Price in 18 decimals
         vm.stopPrank();
 
         vm.startPrank(investor2);
 
         // Approve payment (100 tokens * 2 HBAR = 200 HBAR total)
-        uint256 totalCost = 100 * 10**18 * 2; // amount in wei * price (not in wei)
+        uint256 totalCost = 200 * 10**18; // Total cost after normalization: (amount * price) / 1e18
         paymentToken.approve(address(handler), totalCost);
 
         // Calculate expected fee (2.5% of total cost)
@@ -391,7 +405,7 @@ contract PropertyTokenHandlerTest is Test {
 
         assertEq(totalRevenue, 1000 * 10**18);
         assertEq(lastDistribution, block.timestamp);
-        assertEq(revenuePerToken, 1); // Integer division: (1000 * 10^18) / (1000 * 10^18) = 1
+        assertEq(revenuePerToken, 1e18); // With precision multiplier: (1000 * 10^18 * 1e18) / (1000 * 10^18) = 1e18
 
         vm.stopPrank();
     }
@@ -446,11 +460,10 @@ contract PropertyTokenHandlerTest is Test {
     function testSetAccreditedInvestor() public {
         vm.startPrank(admin);
 
-        handler.setAccreditedInvestor(investor1, true);
-        assertTrue(handler.accreditedInvestors(investor1));
+        assertTrue(kycRegistry.isAccreditedInvestor(investor1));
 
-        handler.setAccreditedInvestor(investor1, false);
-        assertFalse(handler.accreditedInvestors(investor1));
+        kycRegistry.setAccreditedInvestor(investor1, false);
+        assertFalse(kycRegistry.isAccreditedInvestor(investor1));
 
         vm.stopPrank();
     }
@@ -459,7 +472,7 @@ contract PropertyTokenHandlerTest is Test {
         vm.startPrank(nonAccredited);
 
         vm.expectRevert();
-        handler.setAccreditedInvestor(investor1, true);
+        kycRegistry.setAccreditedInvestor(investor1, true);
 
         vm.stopPrank();
     }
@@ -523,7 +536,7 @@ contract PropertyTokenHandlerTest is Test {
 
         // Set as accredited and purchase tokens
         vm.prank(admin);
-        handler.setAccreditedInvestor(investor, true);
+        kycRegistry.setAccreditedInvestor(investor, true);
 
         vm.startPrank(investor);
         // Convert amount from wei to base units: amount / 10**18

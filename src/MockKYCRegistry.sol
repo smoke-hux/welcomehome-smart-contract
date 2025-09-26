@@ -317,4 +317,60 @@ contract MockKYCRegistry is AccessControl, ReentrancyGuard, Pausable {
     function isKYCSystemActive() external view returns (bool) {
         return !paused();
     }
+
+    /// @notice Frontend helper function to get user's complete KYC status
+    function getUserKYCInfo(address user) external view returns (
+        KYCStatus status,
+        InvestorType investorType,
+        bool isAccredited,
+        uint256 approvedAt,
+        uint256 expiresAt,
+        bool isExpired
+    ) {
+        KYCRecord memory record = kycRecords[user];
+        bool expired = (record.status == KYCStatus.APPROVED && block.timestamp >= record.expiresAt);
+
+        return (
+            expired ? KYCStatus.EXPIRED : record.status,
+            record.investorType,
+            accreditedInvestors[user] && this.isKYCApproved(user),
+            record.approvedAt,
+            record.expiresAt,
+            expired
+        );
+    }
+
+    /// @notice Get user eligibility for token purchases
+    function canUserPurchaseTokens(address user) external view returns (
+        bool canPurchase,
+        string memory reason
+    ) {
+        if (!this.isKYCApproved(user)) {
+            return (false, "KYC not approved or expired");
+        }
+
+        if (!this.isAccreditedInvestor(user)) {
+            return (false, "User is not an accredited investor");
+        }
+
+        return (true, "");
+    }
+
+    /// @notice Get paginated list of approved users for admin interface
+    function getApprovedUsersPaginated(uint256 offset, uint256 limit) external view returns (
+        address[] memory users,
+        uint256 totalCount
+    ) {
+        uint256 end = offset + limit;
+        if (end > approvedUsers.length) {
+            end = approvedUsers.length;
+        }
+
+        users = new address[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            users[i - offset] = approvedUsers[i];
+        }
+
+        return (users, approvedUsers.length);
+    }
 }
